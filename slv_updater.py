@@ -11,7 +11,7 @@ DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 SOURCE_URL = "https://www.ishares.com/us/products/239855/ishares-silver-trust-fund"
 
 def get_slv_data():
-    """从 iShares 官网抓取权威数据并精准提取"""
+    """从 iShares 官网抓取库存和份额数据"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     }
@@ -20,82 +20,72 @@ def get_slv_data():
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # 1. 定位包含 "Ounces in Trust" 的文本块
-        target_label = soup.find(string=re.compile(r'Ounces in Trust'))
-        if not target_label:
-            print("错误: 页面上未找到 'Ounces in Trust' 标签。")
-            return None, None
+        # --- 1. 抓取库存 (Ounces in Trust) ---
+        target_ounces = soup.find(string=re.compile(r'Ounces in Trust'))
+        # --- 2. 抓取份额 (Shares Outstanding) ---
+        target_shares = soup.find(string=re.compile(r'Shares Outstanding'))
 
-        # 获取该标签周围的完整文本内容
-        container_text = target_label.find_parent().find_parent().get_text(separator=" ", strip=True)
-        print(f"原始抓取文本: {container_text}")
+        if not target_ounces or not target_shares:
+            print("错误: 页面上未找到关键数据标签。")
+            return None, None, None
 
-        # 2. 提取日期 (格式: Mar 11, 2026)
-        date_match = re.search(r'([A-Z][a-z]{2}\s\d{1,2},\s202\d)', container_text)
-        if not date_match:
-            print("错误: 无法提取日期。")
-            return None, None
-        
-        raw_date_str = date_match.group(1)
-        date_obj = datetime.datetime.strptime(raw_date_str, "%b %d, %Y")
+        def extract_info(label_node):
+            """提取日期和紧随其后的数值"""
+            container = label_node.find_parent().find_parent().get_text(separator=" ", strip=True)
+            # 提取日期
+            date_match = re.search(r'([A-Z][a-z]{2}\s\d{1,2},\s202\d)', container)
+            if not date_match: return None, None
+            
+            raw_date = date_match.group(1)
+            # 提取数值 (在日期之后寻找带逗号的数字)
+            text_after_date = container.split(raw_date)[1]
+            val_match = re.search(r'(\d{1,3}(?:,\d{3})+(?:\.\d+)?)', text_after_date)
+            val = float(val_match.group(1).replace(",", "")) if val_match else None
+            return raw_date, val
+
+        date_str_o, ounces = extract_info(target_ounces)
+        date_str_s, shares = extract_info(target_shares)
+
+        # 校验日期是否一致（确保是同一天的数据）
+        if date_str_o != date_str_s:
+            print(f"警告: 库存日期({date_str_o})与份额日期({date_str_s})不匹配！")
+
+        date_obj = datetime.datetime.strptime(date_str_o, "%b %d, %Y")
         formatted_date = date_obj.strftime("%Y-%m-%d")
 
-        # 3. 提取数值 (核心修复：跳过日期，寻找带逗号的大数字)
-        # 逻辑：在日期字符串出现之后的位置寻找数值
-        parts = container_text.split(raw_date_str)
-        if len(parts) < 2:
-            print("错误: 文本结构异常，无法定位数值位置。")
-            return None, None
-        
-        text_after_date = parts[1]
-        # 匹配 499,592,395.30 这种格式（必须包含至少一个逗号，防止误抓单一数字）
-        value_match = re.search(r'(\d{1,3}(?:,\d{3})+(?:\.\d+)?)', text_after_date)
-        
-        if not value_match:
-            print(f"错误: 在日期之后未发现有效盎司数值。剩余文本: {text_after_date}")
-            return None, None
-
-        # 清洗数值：移除逗号并转为浮点数
-        ounces_value = float(value_match.group(1).replace(",", ""))
-
         print(f"--- 提取成功 ---")
-        print(f"日期: {formatted_date}")
-        print(f"盎司: {ounces_value}")
-        return formatted_date, ounces_value
+        print(f"日期: {formatted_date} | 库存: {ounces} | 份额: {shares}")
+        return formatted_date, ounces, shares
 
     except Exception as e:
         print(f"抓取异常: {e}")
-        return None, None
+        return None, None, None
 
-def write_to_notion(date, ounces):
-    """将数据安全写入 Notion"""
+def write_to_notion(date, ounces, shares):
+    """将数据写入 Notion"""
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
 
-    # 1. 查重：检查该日期是否已有记录
+    # 查重
     query_url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     query_payload = {"filter": {"property": "Date", "date": {"equals": date}}}
     check_res = requests.post(query_url, headers=headers, json=query_payload)
     
-    if check_res.status_code == 200:
-        results = check_res.json().get("results", [])
-        if len(results) > 0:
-            print(f"通知: Notion 中已存在 {date} 的记录，跳过。")
-            return
-    else:
-        print(f"Notion 查询失败: {check_res.text}")
+    if check_res.status_code == 200 and len(check_res.json().get("results", [])) > 0:
+        print(f"通知: Notion 中已存在 {date} 的记录，跳过。")
         return
 
-    # 2. 写入数据
+    # 写入数据
     create_url = "https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": DATABASE_ID},
         "properties": {
             "Date": {"date": {"start": date}},
-            "Ounces In trus": {"number": ounces}  # 确保 Notion 中此列为数字属性
+            "Ounces In trus": {"number": ounces},
+            "Shares Outstanding": {"number": shares} # 注意：此处名称须与 Notion 列表名严格一致
         }
     }
     
@@ -103,12 +93,12 @@ def write_to_notion(date, ounces):
     if res.status_code == 200:
         print(f"成功写入 Notion 表格！")
     else:
-        print(f"Notion 写入失败: {res.status_code} - {res.text}")
+        print(f"Notion 写入失败: {res.text}")
 
 if __name__ == "__main__":
-    d, o = get_slv_data()
-    if d and o:
-        write_to_notion(d, o)
+    d, o, s = get_slv_data()
+    if d and o and s:
+        write_to_notion(d, o, s)
     else:
         print("由于抓取数据不完整，脚本已终止。")
         sys.exit(1)
